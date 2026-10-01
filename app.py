@@ -16,6 +16,8 @@ from urllib.parse import urlparse
 PORT = 8205
 ROLES = {"viewer", "operator", "airspace_reviewer", "commander", "auditor"}
 ACTIVE_STATUSES = {"submitted", "approved"}
+SLOT_MINUTES = 30          # 走廊时隙长度（分钟）
+DEFAULT_SLOT_CAPACITY = 3  # 单个时隙可容纳的计划数
 
 
 class ApiError(Exception):
@@ -42,6 +44,19 @@ def boxes_overlap(a: tuple[float, float, float, float], b: tuple[float, float, f
 
 
 def times_overlap(a_start: datetime, a_end: datetime, b_start: datetime, b_end: datetime) -> bool: return a_start < b_end and b_start < a_end
+
+
+def slot_buckets(start: datetime, end: datetime, slot_minutes: int) -> list[tuple[datetime, datetime]]:
+    """把飞行时间范围切成走廊时隙桶（左闭右开）。"""
+    first = (int(start.timestamp() // 60) // slot_minutes) * slot_minutes
+    last = ((int(end.timestamp() // 60) - 1) // slot_minutes) * slot_minutes
+    buckets: list[tuple[datetime, datetime]] = []
+    m = first
+    while m <= last:
+        buckets.append((datetime.fromtimestamp(m * 60, tz=timezone.utc),
+                        datetime.fromtimestamp((m + slot_minutes) * 60, tz=timezone.utc)))
+        m += slot_minutes
+    return buckets
 
 
 def validate_route(route: Any) -> list[list[float]]:
@@ -85,7 +100,21 @@ class Repository:
             id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER, actor TEXT NOT NULL, role TEXT NOT NULL, action TEXT NOT NULL,
             detail_json TEXT NOT NULL, created_at TEXT NOT NULL
         );
+        CREATE TABLE IF NOT EXISTS slot_ledger(
+            id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id INTEGER NOT NULL REFERENCES flight_plans(id),
+            slot_start TEXT NOT NULL, slot_end TEXT NOT NULL, occupied_at TEXT NOT NULL, released_at TEXT
+        );
+        CREATE INDEX IF NOT EXISTS idx_slot_ledger_active ON slot_ledger(slot_start) WHERE released_at IS NULL;
+        CREATE TABLE IF NOT EXISTS corridor_meta(
+            key TEXT PRIMARY KEY, value TEXT NOT NULL
+        );
         """)
+        self.conn.execute("INSERT OR IGNORE INTO corridor_meta(key,value) VALUES('capacity_version','0')")
+        for column in ("queued_at TEXT", "earliest_release_at TEXT"):
+            name = column.split()[0]
+            existing = {row["name"] for row in self.conn.execute("PRAGMA table_info(flight_plans)")}
+            if name not in existing:
+                self.conn.execute(f"ALTER TABLE flight_plans ADD COLUMN {column}")
 
     @contextmanager
     def tx(self):
@@ -104,7 +133,10 @@ class Repository:
 
 
 class DroneAirspaceService:
-    def __init__(self, path: str | Path): self.repo = Repository(path)
+    def __init__(self, path: str | Path, slot_capacity: int = DEFAULT_SLOT_CAPACITY, slot_minutes: int = SLOT_MINUTES):
+        self.repo = Repository(path)
+        self.slot_capacity = slot_capacity
+        self.slot_minutes = slot_minutes
 
     @staticmethod
     def identity(headers: Any) -> tuple[str, str, str]:
@@ -130,7 +162,34 @@ class DroneAirspaceService:
         with self.repo.tx() as conn:
             cur = conn.execute("""INSERT INTO restrictions(name,kind,min_lon,min_lat,max_lon,max_lat,min_altitude,max_altitude,starts_at,ends_at,reason,created_at)
                                   VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""", (name, kind, min_lon, min_lat, max_lon, max_lat, min_alt, max_alt, iso(start), iso(end), reason, iso()))
-            return dict(conn.execute("SELECT * FROM restrictions WHERE id=?", (cur.lastrowid,)).fetchone())
+            restriction = conn.execute("SELECT * FROM restrictions WHERE id=?", (cur.lastrowid,)).fetchone()
+            invalidated = self._invalidate_overlapping_plans(conn, restriction, actor, role)
+            Repository.audit(conn, None, actor, role, "restriction_created", {"restriction_id": restriction["id"], "invalidated": invalidated})
+            return {"restriction": dict(restriction), "invalidated_plan_ids": invalidated}
+
+    def update_restriction(self, restriction_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
+        if role not in {"airspace_reviewer", "commander"}: raise ApiError(403, "restriction_forbidden", "只有空域审核员或指挥官可以维护限制")
+        with self.repo.tx() as conn:
+            row = conn.execute("SELECT * FROM restrictions WHERE id=?", (restriction_id,)).fetchone()
+            if not row: raise ApiError(404, "restriction_not_found", "限制不存在")
+            name = str(body.get("name", row["name"])).strip(); kind = str(body.get("kind", row["kind"])).strip()
+            reason = str(body.get("reason", row["reason"])).strip()
+            if kind not in {"no_fly", "temporary_limit"} or not name or not reason: raise ApiError(400, "invalid_restriction", "名称、类型和原因必填")
+            try:
+                min_lon = float(body.get("min_lon", row["min_lon"])); min_lat = float(body.get("min_lat", row["min_lat"]))
+                max_lon = float(body.get("max_lon", row["max_lon"])); max_lat = float(body.get("max_lat", row["max_lat"]))
+                min_alt = float(body.get("min_altitude", row["min_altitude"])); max_alt = float(body.get("max_altitude", row["max_altitude"]))
+            except (TypeError, ValueError): raise ApiError(400, "invalid_restriction", "空域范围和高度必须为数字")
+            start = parse_time(body.get("starts_at", row["starts_at"])); end = parse_time(body.get("ends_at", row["ends_at"]))
+            if min_lon >= max_lon or min_lat >= max_lat or min_alt < 0 or max_alt <= min_alt or end <= start:
+                raise ApiError(400, "invalid_restriction", "空域范围、高度或时间无效")
+            conn.execute("""UPDATE restrictions SET name=?,kind=?,min_lon=?,min_lat=?,max_lon=?,max_lat=?,min_altitude=?,max_altitude=?,
+                            starts_at=?,ends_at=?,reason=? WHERE id=?""",
+                         (name, kind, min_lon, min_lat, max_lon, max_lat, min_alt, max_alt, iso(start), iso(end), reason, restriction_id))
+            restriction = conn.execute("SELECT * FROM restrictions WHERE id=?", (restriction_id,)).fetchone()
+            invalidated = self._invalidate_overlapping_plans(conn, restriction, actor, role)
+            Repository.audit(conn, None, actor, role, "restriction_updated", {"restriction_id": restriction_id, "invalidated": invalidated})
+            return {"restriction": dict(restriction), "invalidated_plan_ids": invalidated}
 
     def create_plan(self, actor: str, role: str, operator: str, body: dict[str, Any]) -> dict[str, Any]:
         if role != "operator": raise ApiError(403, "plan_forbidden", "只有运营方可以创建飞行计划")
@@ -161,6 +220,95 @@ class DroneAirspaceService:
     @staticmethod
     def _route(row: sqlite3.Row) -> list[list[float]]: return json.loads(row["route_json"])
 
+    # ---- 时隙台账 ----
+    def _capacity_version(self, conn: sqlite3.Connection) -> int:
+        row = conn.execute("SELECT value FROM corridor_meta WHERE key='capacity_version'").fetchone()
+        return int(row["value"]) if row else 0
+
+    def _bump_capacity_version(self, conn: sqlite3.Connection) -> None:
+        conn.execute("UPDATE corridor_meta SET value=CAST(CAST(value AS INTEGER)+1 AS TEXT) WHERE key='capacity_version'")
+
+    def _plan_slots(self, plan: sqlite3.Row) -> list[tuple[datetime, datetime]]:
+        return slot_buckets(parse_time(plan["starts_at"]), parse_time(plan["ends_at"]), self.slot_minutes)
+
+    def _slot_occupancy(self, conn: sqlite3.Connection, slot_start_iso: str) -> int:
+        return conn.execute("SELECT COUNT(*) AS c FROM slot_ledger WHERE slot_start=? AND released_at IS NULL",
+                            (slot_start_iso,)).fetchone()["c"]
+
+    def _occupy_slots(self, conn: sqlite3.Connection, plan: sqlite3.Row) -> None:
+        now = iso()
+        for slot_start, slot_end in self._plan_slots(plan):
+            conn.execute("INSERT INTO slot_ledger(plan_id,slot_start,slot_end,occupied_at) VALUES(?,?,?,?)",
+                         (plan["id"], iso(slot_start), iso(slot_end), now))
+        self._bump_capacity_version(conn)
+
+    def _release_slots(self, conn: sqlite3.Connection, plan_id: int) -> None:
+        conn.execute("UPDATE slot_ledger SET released_at=? WHERE plan_id=? AND released_at IS NULL", (iso(), plan_id))
+        self._bump_capacity_version(conn)
+
+    def _earliest_release(self, conn: sqlite3.Connection, plan: sqlite3.Row) -> datetime | None:
+        """计划所需时隙全部腾出容量的最早时刻；当前即可用则返回 None。"""
+        now = utcnow(); worst = now
+        for slot_start, _ in self._plan_slots(plan):
+            slot_iso = iso(slot_start)
+            occupancy = self._slot_occupancy(conn, slot_iso)
+            if occupancy < self.slot_capacity:
+                continue
+            need = occupancy - self.slot_capacity + 1
+            rows = conn.execute("""SELECT p.ends_at AS ends_at FROM slot_ledger l JOIN flight_plans p ON p.id=l.plan_id
+                                   WHERE l.slot_start=? AND l.released_at IS NULL ORDER BY p.ends_at ASC""", (slot_iso,)).fetchall()
+            releases = sorted(max(parse_time(r["ends_at"]), now) for r in rows)
+            if len(releases) >= need and releases[need - 1] > worst:
+                worst = releases[need - 1]
+        return None if worst <= now else worst
+
+    def _slot_status(self, conn: sqlite3.Connection, plan: sqlite3.Row) -> dict[str, Any]:
+        slots = []; min_remaining = self.slot_capacity
+        for slot_start, slot_end in self._plan_slots(plan):
+            occupancy = self._slot_occupancy(conn, iso(slot_start))
+            remaining = max(self.slot_capacity - occupancy, 0)
+            min_remaining = min(min_remaining, remaining)
+            slots.append({"slot_start": iso(slot_start), "slot_end": iso(slot_end),
+                          "occupied": occupancy, "capacity": self.slot_capacity, "remaining": remaining})
+        available = min_remaining > 0
+        earliest = None if available else self._earliest_release(conn, plan)
+        return {"capacity": self.slot_capacity, "slot_minutes": self.slot_minutes, "slots": slots,
+                "remaining_capacity": min_remaining, "slot_available": available,
+                "earliest_release_at": iso(earliest) if earliest else None,
+                "capacity_version": self._capacity_version(conn)}
+
+    def _invalidate_overlapping_plans(self, conn: sqlite3.Connection, restriction: sqlite3.Row, actor: str, role: str) -> list[int]:
+        """禁飞区/限制更新后，让重叠的已批准计划立即失效并释放时隙占用。"""
+        rbox = (restriction["min_lon"], restriction["min_lat"], restriction["max_lon"], restriction["max_lat"])
+        now = iso(); affected: list[sqlite3.Row] = []
+        for plan in conn.execute("SELECT * FROM flight_plans WHERE status='approved'"):
+            if not boxes_overlap(route_bbox(self._route(plan)), rbox): continue
+            if not times_overlap(parse_time(plan["starts_at"]), parse_time(plan["ends_at"]),
+                                 parse_time(restriction["starts_at"]), parse_time(restriction["ends_at"])): continue
+            if not (plan["max_altitude"] > restriction["min_altitude"] and restriction["max_altitude"] > 0): continue
+            affected.append(plan)
+        for plan in affected:
+            conn.execute("UPDATE flight_plans SET status='submitted',queued_at=NULL,earliest_release_at=NULL,updated_at=? WHERE id=?", (now, plan["id"]))
+            conn.execute("UPDATE slot_ledger SET released_at=? WHERE plan_id=? AND released_at IS NULL", (now, plan["id"]))
+            Repository.audit(conn, plan["id"], actor, role, "approval_invalidated_by_airspace_change",
+                             {"restriction_id": restriction["id"], "restriction_name": restriction["name"], "kind": restriction["kind"]})
+            Repository.notify(conn, plan["id"], "airspace_change",
+                              f"空域限制变化，飞行计划 {plan['callsign']} 批准已失效，需重新审核")
+        if affected: self._bump_capacity_version(conn)
+        return [plan["id"] for plan in affected]
+
+    def ledger(self, role: str) -> dict[str, Any]:
+        if role not in {"airspace_reviewer", "commander", "auditor"}: raise ApiError(403, "ledger_forbidden", "当前角色不能查看时隙台账")
+        conn = self.repo.conn
+        rows = conn.execute("""SELECT slot_start, slot_end, COUNT(*) AS occupied FROM slot_ledger
+                               WHERE released_at IS NULL GROUP BY slot_start, slot_end ORDER BY slot_start""").fetchall()
+        slots = [{"slot_start": r["slot_start"], "slot_end": r["slot_end"], "occupied": r["occupied"],
+                  "capacity": self.slot_capacity, "remaining": max(self.slot_capacity - r["occupied"], 0)} for r in rows]
+        queued = [dict(r) for r in conn.execute("""SELECT id,callsign,operator_id,starts_at,ends_at,earliest_release_at,queued_at
+                                                   FROM flight_plans WHERE status='queued' ORDER BY queued_at""")]
+        return {"capacity": self.slot_capacity, "slot_minutes": self.slot_minutes,
+                "capacity_version": self._capacity_version(conn), "slots": slots, "queued": queued, "server_time": iso()}
+
     def check_conflicts(self, plan_id: int, role: str, operator: str) -> dict[str, Any]:
         with self.repo.tx() as conn:
             plan = self._plan_row(conn, plan_id)
@@ -182,12 +330,15 @@ class DroneAirspaceService:
             if altitude_overlap:
                 item = {"code": "airspace_restriction", "restriction_id": restriction["id"], "name": restriction["name"], "kind": restriction["kind"], "reason": restriction["reason"]}
                 blocking.append(item)
-        adjacent: list[dict[str, Any]] = []
-        for other in conn.execute("SELECT * FROM flight_plans WHERE id!=? AND status IN ('submitted','approved') AND starts_at<? AND ends_at>?", (plan["id"], iso(end), iso(start))):
+        traffic_advisories: list[dict[str, Any]] = []
+        for other in conn.execute("SELECT * FROM flight_plans WHERE id!=? AND status IN ('submitted','approved','queued') AND starts_at<? AND ends_at>?", (plan["id"], iso(end), iso(start))):
             if boxes_overlap(bbox, route_bbox(self._route(other)), 0.002):
-                adjacent.append({"plan_id": other["id"], "callsign": other["callsign"], "operator_id": other["operator_id"], "status": other["status"], "starts_at": other["starts_at"], "ends_at": other["ends_at"]})
-        if adjacent: blocking.append({"code": "adjacent_traffic", "plans": adjacent, "message": "相邻航路与有效计划重叠"})
-        return {"plan_id": plan["id"], "revision": plan["revision"], "hard_violations": hard, "blocking_conflicts": blocking, "approvable": not hard and not blocking}
+                traffic_advisories.append({"plan_id": other["id"], "callsign": other["callsign"], "operator_id": other["operator_id"], "status": other["status"], "starts_at": other["starts_at"], "ends_at": other["ends_at"]})
+        slot_status = self._slot_status(conn, plan)
+        return {"plan_id": plan["id"], "revision": plan["revision"], "hard_violations": hard,
+                "blocking_conflicts": blocking, "traffic_advisories": traffic_advisories,
+                "slot_status": slot_status,
+                "approvable": not hard and not blocking and slot_status["slot_available"]}
 
     def get_plan(self, plan_id: int, role: str, operator: str = "") -> dict[str, Any]:
         conn = self.repo.conn; row = self._plan_row(conn, plan_id)
@@ -214,7 +365,10 @@ class DroneAirspaceService:
         if role not in {"airspace_reviewer", "commander"}: raise ApiError(403, "review_forbidden", "只有空域审核员或指挥官可以批准")
         expected, offline_id = body.get("expected_revision"), str(body.get("offline_id", "")).strip()
         reason, override = str(body.get("reason", "")).strip(), str(body.get("override_reason", "")).strip()
+        expected_capacity = body.get("expected_capacity_version")
         if not isinstance(expected, int) or not offline_id or not reason: raise ApiError(400, "review_details_required", "expected_revision、offline_id 和 reason 必填")
+        if expected_capacity is not None and (not isinstance(expected_capacity, int) or isinstance(expected_capacity, bool)):
+            raise ApiError(400, "review_details_required", "expected_capacity_version 必须为整数")
         with self.repo.tx() as conn:
             prior = conn.execute("SELECT * FROM approvals WHERE offline_id=?", (offline_id,)).fetchone()
             if prior:
@@ -223,20 +377,41 @@ class DroneAirspaceService:
                 raise ApiError(409, "offline_id_conflict", "该离线审核编号已经用于其他决定")
             plan = self._plan_row(conn, plan_id)
             if plan["status"] == "approved": return {"plan": self.get_plan(plan_id, role, ""), "idempotent": True}
-            if plan["status"] != "submitted": raise ApiError(409, "invalid_transition", "只有已提交计划可以批准")
+            if plan["status"] not in {"submitted", "queued"}: raise ApiError(409, "invalid_transition", "只有已提交或排队中的计划可以批准")
             if plan["revision"] != expected: raise ApiError(409, "revision_conflict", "计划版本已变化，审核决定不能套用")
             report = self._conflict_report(conn, plan)
             if report["hard_violations"]: raise ApiError(409, "hard_constraint_violation", "计划违反不可覆盖的安全约束", report)
-            if report["blocking_conflicts"] and not (role == "commander" and override):
+            emergency = role == "commander" and bool(override)
+            if report["blocking_conflicts"] and not emergency:
                 raise ApiError(409, "airspace_conflict", "计划存在空域或相邻交通冲突", report)
-            override_kind = "emergency_authority" if report["blocking_conflicts"] else None
+            slot_status = self._slot_status(conn, plan)
+            capacity_version = self._capacity_version(conn)
+            if expected_capacity is not None and expected_capacity != capacity_version:
+                raise ApiError(409, "capacity_version_conflict", "时隙容量版本已变化，剩余容量与版本以当前台账为准",
+                               {**slot_status, "capacity_version": capacity_version})
+            override_kind = "emergency_authority" if emergency else None
+            if not slot_status["slot_available"] and not emergency:
+                conn.execute("UPDATE flight_plans SET status='queued',queued_at=?,earliest_release_at=?,updated_at=? WHERE id=?",
+                             (iso(), slot_status["earliest_release_at"], iso(), plan_id))
+                Repository.audit(conn, plan_id, actor, role, "plan_queued",
+                                 {"earliest_release_at": slot_status["earliest_release_at"], "capacity_version": capacity_version})
+                return {"plan": self.get_plan(plan_id, role, ""), "idempotent": False, "queued": True,
+                        "earliest_release_at": slot_status["earliest_release_at"],
+                        "remaining_capacity": slot_status["remaining_capacity"], "capacity_version": capacity_version}
             cur = conn.execute("""INSERT INTO approvals(plan_id,plan_revision,reviewer,decision,reason,offline_id,override_kind,created_at)
                                   VALUES(?,?,?,?,?,?,?,?)""", (plan_id, expected, actor, "approved", reason, offline_id, override_kind, iso()))
-            conn.execute("UPDATE flight_plans SET status='approved',updated_at=? WHERE id=?", (iso(), plan_id))
-            if override_kind: Repository.audit(conn, plan_id, actor, role, "emergency_override_used", {"override_reason": override, "conflicts": report["blocking_conflicts"]})
-            Repository.audit(conn, plan_id, actor, role, "plan_approved", {"revision": expected, "offline_id": offline_id})
+            conn.execute("UPDATE flight_plans SET status='approved',queued_at=NULL,earliest_release_at=NULL,updated_at=? WHERE id=?", (iso(), plan_id))
+            self._occupy_slots(conn, plan)
+            if override_kind: Repository.audit(conn, plan_id, actor, role, "emergency_override_used",
+                                               {"override_reason": override, "conflicts": report["blocking_conflicts"],
+                                                "slot_available": slot_status["slot_available"]})
+            Repository.audit(conn, plan_id, actor, role, "plan_approved",
+                             {"revision": expected, "offline_id": offline_id, "override_kind": override_kind,
+                              "capacity_version": self._capacity_version(conn)})
             Repository.notify(conn, plan_id, "approved", f"飞行计划 {plan['callsign']} 已批准")
-            return {"plan": self.get_plan(plan_id, role, ""), "idempotent": False, "approval_id": cur.lastrowid, "override_kind": override_kind}
+            return {"plan": self.get_plan(plan_id, role, ""), "idempotent": False, "approval_id": cur.lastrowid,
+                    "override_kind": override_kind, "queued": False,
+                    "remaining_capacity": slot_status["remaining_capacity"], "capacity_version": self._capacity_version(conn)}
 
     def reject(self, plan_id: int, actor: str, role: str, body: dict[str, Any]) -> dict[str, Any]:
         if role not in {"airspace_reviewer", "commander"}: raise ApiError(403, "review_forbidden", "当前角色不能拒绝计划")
@@ -248,9 +423,9 @@ class DroneAirspaceService:
                 if prior["plan_id"] == plan_id and prior["plan_revision"] == expected and prior["decision"] == "rejected": return {"plan": self.get_plan(plan_id, role, ""), "idempotent": True}
                 raise ApiError(409, "offline_id_conflict", "该离线审核编号已经被使用")
             plan = self._plan_row(conn, plan_id)
-            if plan["status"] != "submitted" or plan["revision"] != expected: raise ApiError(409, "revision_conflict", "计划状态或版本不匹配")
+            if plan["status"] not in {"submitted", "queued"} or plan["revision"] != expected: raise ApiError(409, "revision_conflict", "计划状态或版本不匹配")
             conn.execute("INSERT INTO approvals(plan_id,plan_revision,reviewer,decision,reason,offline_id,created_at) VALUES(?,?,?,?,?,?,?)", (plan_id, expected, actor, "rejected", reason, offline_id, iso()))
-            conn.execute("UPDATE flight_plans SET status='rejected',updated_at=? WHERE id=?", (iso(), plan_id))
+            conn.execute("UPDATE flight_plans SET status='rejected',queued_at=NULL,earliest_release_at=NULL,updated_at=? WHERE id=?", (iso(), plan_id))
             Repository.audit(conn, plan_id, actor, role, "plan_rejected", {"reason": reason, "offline_id": offline_id})
             Repository.notify(conn, plan_id, "rejected", f"飞行计划 {plan['callsign']} 被拒绝：{reason}")
             return {"plan": self.get_plan(plan_id, role, ""), "idempotent": False}
@@ -271,8 +446,10 @@ class DroneAirspaceService:
             risk = body.get("population_risk", plan["population_risk"])
             if not 0 <= payload <= 25 or altitude <= 0 or not isinstance(risk, int) or not 0 <= risk <= 5: raise ApiError(400, "invalid_plan", "变更后的载荷、高度或风险无效")
             revision = expected + 1
-            conn.execute("""UPDATE flight_plans SET route_json=?,starts_at=?,ends_at=?,payload_kg=?,max_altitude=?,population_risk=?,emergency_plan=?,region=?,status='draft',revision=?,updated_at=? WHERE id=?""",
+            conn.execute("""UPDATE flight_plans SET route_json=?,starts_at=?,ends_at=?,payload_kg=?,max_altitude=?,population_risk=?,emergency_plan=?,region=?,status='draft',
+                            queued_at=NULL,earliest_release_at=NULL,revision=?,updated_at=? WHERE id=?""",
                          (json.dumps(route), iso(start), iso(end), payload, altitude, risk, body.get("emergency_plan", plan["emergency_plan"]), body.get("region", plan["region"]), revision, iso(), plan_id))
+            if plan["status"] == "approved": self._release_slots(conn, plan_id)
             Repository.audit(conn, plan_id, actor, role, "plan_changed", {"from_revision": expected, "to_revision": revision, "previous_status": plan["status"]})
             if plan["status"] == "approved": Repository.notify(conn, plan_id, "approval_invalidated", f"飞行计划 {plan['callsign']} 已修改，原批准自动失效")
             else: Repository.notify(conn, plan_id, "changed", f"飞行计划 {plan['callsign']} 已更新，需重新提交审核")
@@ -287,7 +464,8 @@ class DroneAirspaceService:
             if role not in {"operator", "airspace_reviewer", "commander"}: raise ApiError(403, "cancel_forbidden", "当前角色不能取消计划")
             if plan["status"] == "canceled": return {"plan": self.get_plan(plan_id, role, operator), "idempotent": True}
             if plan["status"] == "expired": raise ApiError(409, "plan_expired", "已过期计划不能取消")
-            conn.execute("UPDATE flight_plans SET status='canceled',updated_at=? WHERE id=?", (iso(), plan_id))
+            if plan["status"] == "approved": self._release_slots(conn, plan_id)
+            conn.execute("UPDATE flight_plans SET status='canceled',queued_at=NULL,earliest_release_at=NULL,updated_at=? WHERE id=?", (iso(), plan_id))
             Repository.audit(conn, plan_id, actor, role, "plan_canceled", {"reason": reason})
             Repository.notify(conn, plan_id, "canceled", f"飞行计划 {plan['callsign']} 已取消：{reason}")
             return {"plan": self.get_plan(plan_id, role, operator), "idempotent": False}
@@ -305,9 +483,11 @@ class DroneAirspaceService:
         with self.repo.tx() as conn:
             rows = list(conn.execute("SELECT * FROM flight_plans WHERE status='approved' AND ends_at<=?", (now,)))
             for row in rows:
-                conn.execute("UPDATE flight_plans SET status='expired',updated_at=? WHERE id=?", (now, row["id"]))
+                conn.execute("UPDATE flight_plans SET status='expired',queued_at=NULL,earliest_release_at=NULL,updated_at=? WHERE id=?", (now, row["id"]))
+                conn.execute("UPDATE slot_ledger SET released_at=? WHERE plan_id=? AND released_at IS NULL", (now, row["id"]))
                 Repository.audit(conn, row["id"], actor, role, "plan_expired", {})
                 Repository.notify(conn, row["id"], "expired", f"飞行计划 {row['callsign']} 已过期")
+            if rows: self._bump_capacity_version(conn)
         return {"expired": len(rows)}
 
     def state(self, role: str, operator: str) -> dict[str, Any]:
@@ -319,7 +499,7 @@ class DroneAirspaceService:
         for row in rows:
             item = self.get_plan(row["id"], role, operator); plans.append(item)
         restrictions = [dict(r) for r in conn.execute("SELECT * FROM restrictions WHERE status='active' ORDER BY id DESC")] if role in {"airspace_reviewer", "commander", "auditor"} else []
-        return {"plans": plans, "restrictions": restrictions, "server_time": iso()}
+        return {"plans": plans, "restrictions": restrictions, "capacity_version": self._capacity_version(conn), "server_time": iso()}
 
 
 def send_json(handler: BaseHTTPRequestHandler, status: int, payload: Any) -> None:
@@ -341,6 +521,7 @@ class Handler(BaseHTTPRequestHandler):
         actor, role, operator = self.service.identity(self.headers)
         if path == "/api/state": return 200, self.service.state(role, operator)
         if path == "/api/notifications": return 200, self.service.notifications(actor, role, operator)
+        if path == "/api/corridor/ledger": return 200, self.service.ledger(role)
         parts = [p for p in path.split("/") if p]
         if len(parts) == 3 and parts[:2] == ["api", "plans"] and parts[2].isdigit(): return 200, self.service.get_plan(int(parts[2]), role, operator)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit() and parts[3] == "check": return 200, self.service.check_conflicts(int(parts[2]), role, operator)
@@ -348,6 +529,8 @@ class Handler(BaseHTTPRequestHandler):
     def post_api(self, path: str) -> tuple[int, Any]:
         actor, role, operator = self.service.identity(self.headers); body = self.body(); parts = [p for p in path.split("/") if p]
         if path == "/api/restrictions": return 201, self.service.create_restriction(actor, role, body)
+        if len(parts) == 4 and parts[:2] == ["api", "restrictions"] and parts[2].isdigit() and parts[3] == "update":
+            return 200, self.service.update_restriction(int(parts[2]), actor, role, body)
         if path == "/api/plans": return 201, self.service.create_plan(actor, role, operator, body)
         if path == "/api/expire": return 200, self.service.expire_plans(actor, role)
         if len(parts) == 4 and parts[:2] == ["api", "plans"] and parts[2].isdigit():
